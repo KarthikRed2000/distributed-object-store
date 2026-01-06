@@ -1,7 +1,20 @@
+plugins {
+    application
+}
+
 dependencies {
+    // 1. Depend on the Common module (to see RaftMessage)
     implementation(project(":common"))
 
-    // If we use a Raft library (like Apache Ratis) we add it here.
-    // For now, we assume we are building custom Raft logic using standard Java + Netty.
-    implementation("io.netty:netty-all:4.2.9.Final")
+    // 2. Netty for Networking
+    implementation("io.netty:netty-all:4.1.101.Final")
+
+    // 3. Logging (SLF4J API + Logback Implementation)
+    implementation("org.slf4j:slf4j-api:2.0.9")
+    implementation("ch.qos.logback:logback-classic:1.4.11")
+}
+
+application {
+    // Defines the main class so you can run via ./gradlew run
+    mainClass.set("com.distributed.store.metadata.MetadataServer")
 }

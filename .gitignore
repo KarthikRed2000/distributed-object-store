@@ -1,4 +1,7 @@
-/build
+**/build/**
 /data_node_1
 /.gradle
 /.idea
+/logs
+
+/metadata-node/build
