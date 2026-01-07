@@ -51,7 +51,7 @@ public class ClusterLauncher {
 
             System.out.printf("Launching %s... ", nodeId);
             try {
-                // Pass NodeID and the Config File Path
+
                 runningProcesses.add(startNode(nodeId, CONFIG_FILE));
                 System.out.println("[OK]");
             } catch (IOException e) {
