@@ -69,9 +69,9 @@ public class ClusterClient {
         protected void channelRead0(ChannelHandlerContext ctx, RaftMessage msg) {
             if (msg.getType() == Type.CLIENT_COMMAND) {
                 if (msg.isSuccess()) {
-                    System.out.println("[SUCCESS] Leader committed the command.");
+                    System.out.println("[RESULT]: " + msg.getPayload());
                 } else {
-                    System.out.println("[FAIL] Node is not Leader or replication failed.");
+                    System.out.println("[ERROR]: Not Leader or Request Failed.");
                 }
             }
         }

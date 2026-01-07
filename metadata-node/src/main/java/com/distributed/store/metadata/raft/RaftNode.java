@@ -3,11 +3,14 @@ package com.distributed.store.metadata.raft;
 import com.distributed.store.common.model.LogEntry;
 import com.distributed.store.common.model.RaftMessage;
 import com.distributed.store.common.model.RaftMessage.Type;
+import com.distributed.store.metadata.StateMachine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -29,8 +32,12 @@ public class RaftNode {
     private String leaderId = null;
 
     // Log Storage
-    private final List<LogEntry> log = new ArrayList<>();
+    private List<LogEntry> log = new ArrayList<>();
     private int commitIndex = 0;
+    private final SimpleDiskLog diskLog;
+
+    // Leadership State (Only used when Leader)
+    private final Map<String, Integer> matchIndex = new HashMap<>();
 
     // Timers
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
@@ -43,18 +50,19 @@ public class RaftNode {
     private static final int MAX_TIMEOUT = 4000;
     private static final int HEARTBEAT_INTERVAL = 500;
 
+    private final StateMachine stateMachine = new StateMachine();
+    private int lastApplied = 0;
+
     public RaftNode(String nodeId, RaftTransport transport) {
         this.nodeId = nodeId;
         this.transport = transport;
+        this.diskLog = new SimpleDiskLog(nodeId);
+        this.log = diskLog.load();
         resetElectionTimer();
     }
 
     // --- CLIENT API ---
 
-    /**
-     * Called when a client sends a command to this node.
-     * Returns true if queued, false if not Leader.
-     */
     public synchronized boolean replicate(String command) {
         if (currentRole != Role.LEADER) {
             logger.warn("Received command '{}', but I am not Leader (Leader is: {})", command, leaderId);
@@ -64,6 +72,7 @@ public class RaftNode {
         // 1. Append to local log
         LogEntry entry = new LogEntry(currentTerm, command);
         log.add(entry);
+        persist();
         logger.info("Leader appended entry at index {}: {}", log.size() - 1, entry);
 
         // 2. Broadcast to followers immediately
@@ -76,34 +85,55 @@ public class RaftNode {
     public synchronized RaftMessage handleMessage(RaftMessage msg) {
         if (msg.getTerm() > currentTerm) {
             currentTerm = msg.getTerm();
-            becomeFollower();
+            becomeFollower(msg.getTerm());
         }
 
         switch (msg.getType()) {
-            case CLIENT_COMMAND: return handleClietnCommand(msg);
+            case CLIENT_COMMAND:    return handleClientCommand(msg);
             case REQUEST_VOTE:      return handleRequestVote(msg);
             case APPEND_ENTRIES:    return handleAppendEntries(msg);
             case VOTE_RESPONSE:     handleVoteResponse(msg); return null;
-            case HEARTBEAT_RESPONSE: return null; // TODO: Handle commits
+            case HEARTBEAT_RESPONSE:
+                if (currentRole == Role.LEADER) {
+                    handleHeartbeatResponse(msg);
+                }
+                return null;
             default: return null;
         }
     }
 
-    private RaftMessage handleClietnCommand(RaftMessage msg) {
+    private RaftMessage handleClientCommand(RaftMessage msg) {
         String cmd = msg.getPayload();
-        logger.info("Received command {}", cmd);
+        if (cmd.startsWith("GET ")) {
+            return handleClientGETQuery(msg);
+        } else {
+            return handleClientSETCommand(msg);
+        }
+    }
 
-        boolean success = replicate(cmd);
+    private RaftMessage handleClientGETQuery(RaftMessage msg) {
+        // [MODIFIED] Allow Followers to serve Reads for verification purposes
+        // In Strict Raft, we would check: if (currentRole != Role.LEADER) return failure;
 
-        RaftMessage newMessage = new RaftMessage(Type.CLIENT_COMMAND, nodeId, currentTerm);
-        newMessage.setSuccess(success);
-        return newMessage;
+        String key = msg.getPayload().substring(4).trim();
+        String value = stateMachine.get(key);
+
+        RaftMessage response = new RaftMessage(Type.CLIENT_COMMAND, nodeId, currentTerm, true);
+        response.setPayload(value != null ? value : "(null)");
+        return response;
+    }
+
+    private RaftMessage handleClientSETCommand(RaftMessage msg) {
+        // SET still requires Leader
+        boolean success = replicate(msg.getPayload());
+        RaftMessage response = new RaftMessage(Type.CLIENT_COMMAND, nodeId, currentTerm, success);
+        response.setPayload("OK");
+        return response;
     }
 
     private RaftMessage handleRequestVote(RaftMessage msg) {
         boolean granted = false;
         if (msg.getTerm() >= currentTerm && (votedFor == null || votedFor.equals(msg.getSenderId()))) {
-            // Simplified check: In real Raft, we also check if candidate's log is up-to-date
             votedFor = msg.getSenderId();
             granted = true;
             resetElectionTimer();
@@ -113,25 +143,47 @@ public class RaftNode {
     }
 
     private RaftMessage handleAppendEntries(RaftMessage msg) {
+        // 1. Standard Term Check
         if (msg.getTerm() < currentTerm) {
             return new RaftMessage(Type.HEARTBEAT_RESPONSE, nodeId, currentTerm, false);
         }
 
+        // 2. Acknowledge Leader
         this.leaderId = msg.getSenderId();
-        becomeFollower(); // Refresh follower state
+        becomeFollower(msg.getTerm());
         resetElectionTimer();
 
-        // 1. Append any new entries from Leader
-        if (!msg.getEntries().isEmpty()) {
-            log.addAll(msg.getEntries());
-            logger.info("Follower appended {} entries. Log Size: {}", msg.getEntries().size(), log.size());
+        List<LogEntry> leaderEntries = msg.getEntries();
+
+        // [MODIFIED] 3. LOG REPAIR & CONFLICT RESOLUTION
+        int i = 0;
+        while (i < leaderEntries.size()) {
+            LogEntry leaderEntry = leaderEntries.get(i);
+
+            if (i < log.size()) {
+                LogEntry localEntry = log.get(i);
+                // Conflict detected (Same index, different term)
+                if (localEntry.getTerm() != leaderEntry.getTerm()) {
+                    logger.warn("Conflict at index {}. Truncating log from {} to {}", i, localEntry, leaderEntry);
+                    // Delete this and everything after
+                    while (log.size() > i) {
+                        log.remove(log.size() - 1);
+                    }
+                    log.add(leaderEntry);
+                    persist();
+                }
+            } else {
+                // New entry
+                log.add(leaderEntry);
+                persist();
+            }
+            i++;
         }
 
-        // 2. Update Commit Index
+        // 4. Update Commit Index
         if (msg.getLeaderCommit() > commitIndex) {
-            // commitIndex = min(leaderCommit, index of last new entry)
-            commitIndex = Math.min(msg.getLeaderCommit(), log.size() - 1);
-            logger.debug("Follower commitIndex updated to {}", commitIndex);
+            commitIndex = Math.min(msg.getLeaderCommit(), log.size());
+            applyCommits();
         }
 
         return new RaftMessage(Type.HEARTBEAT_RESPONSE, nodeId, currentTerm, true);
@@ -151,7 +203,32 @@ public class RaftNode {
         }
     }
 
-    private void becomeFollower() {
+    private void handleHeartbeatResponse(RaftMessage msg) {
+        if (msg.isSuccess()) {
+            matchIndex.put(msg.getSenderId(), log.size());
+            updateCommitIndex();
+        }
+    }
+
+    private void updateCommitIndex() {
+        for (int n = log.size(); n > commitIndex; n--) {
+            int replicationCount = 1; // Count Leader (me)
+
+            for (Integer followerIndex : matchIndex.values()) {
+                if (followerIndex >= n) {
+                    replicationCount++;
+                }
+            }
+            if (replicationCount > (transport.getPeerCount() + 1) / 2) {
+                commitIndex = n;
+                applyCommits();
+                break;
+            }
+        }
+    }
+
+    private void becomeFollower(int term) {
+        currentTerm = term;
         currentRole = Role.FOLLOWER;
         votedFor = null;
         if (heartbeatTask != null) heartbeatTask.cancel(false);
@@ -163,13 +240,8 @@ public class RaftNode {
         currentTerm++;
         votedFor = nodeId;
         votesReceived = 1;
-
         logger.info("Candidate for Term {}", currentTerm);
-
-        // Broadcast Vote Request
-        RaftMessage request = new RaftMessage(Type.REQUEST_VOTE, nodeId, currentTerm);
-        transport.broadcast(request);
-
+        transport.broadcast(new RaftMessage(Type.REQUEST_VOTE, nodeId, currentTerm));
         resetElectionTimer();
     }
 
@@ -177,7 +249,7 @@ public class RaftNode {
         if (currentRole == Role.LEADER) return;
         currentRole = Role.LEADER;
         logger.info("!!! BECAME LEADER !!! Term {}", currentTerm);
-
+        matchIndex.clear();
         if (electionTimeoutTask != null) electionTimeoutTask.cancel(false);
         startHeartbeats();
     }
@@ -197,7 +269,6 @@ public class RaftNode {
     }
 
     private void sendAppendEntries() {
-        // Simplified: We assume Followers are always insync for now
         int prevLogIndex = Math.max(0, log.size() - 1);
         int prevLogTerm = log.isEmpty() ? 0 : log.get(prevLogIndex).getTerm();
 
@@ -209,11 +280,7 @@ public class RaftNode {
                 prevLogTerm,
                 commitIndex
         );
-
-        // In a real implementation, we would send ONLY new entries based on nextIndex[]
-        // For this step, we are just maintaining the heartbeat mechanism
         msg.setEntries(new ArrayList<>(log));
-
         transport.broadcast(msg);
     }
 
@@ -231,5 +298,19 @@ public class RaftNode {
                 becomeCandidate();
             }
         }
+    }
+
+    // --- STATE MACHINE ---
+
+    private void applyCommits() {
+        while (lastApplied < commitIndex) {
+            LogEntry entry = log.get(lastApplied);
+            stateMachine.apply(entry.getCommand());
+            lastApplied++;
+        }
+    }
+
+    private void persist() {
+        diskLog.save(log);
     }
 }

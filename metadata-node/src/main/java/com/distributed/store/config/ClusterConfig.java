@@ -12,6 +12,10 @@ public class ClusterConfig {
     // Maps NodeId ("Node_A") -> Address ("localhost:9001")
     private final Map<String, String> peerMap = new HashMap<>();
 
+    protected ClusterConfig() {
+        // Do nothing. The subclass will override the getPort/getPeers methods.
+    }
+
     public ClusterConfig(String configFilePath) throws IOException {
         Properties props = new Properties();
 
