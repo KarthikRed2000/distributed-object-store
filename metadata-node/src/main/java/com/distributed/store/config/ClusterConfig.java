@@ -8,18 +8,14 @@ import java.util.Map;
 import java.util.Properties;
 
 public class ClusterConfig {
-
-    // Maps NodeId ("Node_A") -> Address ("localhost:9001")
     private final Map<String, String> peerMap = new HashMap<>();
 
     protected ClusterConfig() {
-        // Do nothing. The subclass will override the getPort/getPeers methods.
     }
 
     public ClusterConfig(String configFilePath) throws IOException {
         Properties props = new Properties();
 
-        // Load from filesystem
         try (InputStream input = new FileInputStream(configFilePath)) {
             props.load(input);
         }
@@ -27,8 +23,6 @@ public class ClusterConfig {
         // Parse properties starting with "node."
         for (String key : props.stringPropertyNames()) {
             if (key.startsWith("node.")) {
-                // key example: "node.Node_A"
-                // value example: "localhost:9001"
                 String nodeId = key.substring(5); // Strips "node."
                 String address = props.getProperty(key);
 
