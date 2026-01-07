@@ -36,6 +36,10 @@ public class RaftTransport {
         sendToPeer(address, message);
     }
 
+    public int getPeerCount(){
+        return clusterTopology.size() - 1;
+    }
+
     public void broadcast(RaftMessage message) {
         for (Map.Entry<String, String> entry : clusterTopology.entrySet()) {
             String nodeId = entry.getKey();

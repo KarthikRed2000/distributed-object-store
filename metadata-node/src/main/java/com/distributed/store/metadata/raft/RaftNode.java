@@ -1,196 +1,235 @@
 package com.distributed.store.metadata.raft;
 
+import com.distributed.store.common.model.LogEntry;
 import com.distributed.store.common.model.RaftMessage;
+import com.distributed.store.common.model.RaftMessage.Type;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.Collections;
-import java.util.HashSet;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
-import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class RaftNode {
+    private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
-    public enum State {
-        FOLLOWER,
-        CANDIDATE,
-        LEADER
-    }
+    public enum Role { FOLLOWER, CANDIDATE, LEADER }
 
     private final String nodeId;
-    private volatile State state = State.FOLLOWER;
-    private volatile int currentTerm = 0;
-    private volatile String votedFor = null;
-
-    // Thread-safe vote counting
-    private final AtomicInteger votesReceived = new AtomicInteger(0);
-    private final Set<String> votedNodes = Collections.synchronizedSet(new HashSet<>());
-
-    private volatile long lastHeartbeatTime;
-    private volatile long electionTimeout;
-
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    private final Random random = new Random();
     private final RaftTransport transport;
+
+    // State
+    private volatile Role currentRole = Role.FOLLOWER;
+    private int currentTerm = 0;
+    private String votedFor = null;
+    private String leaderId = null;
+
+    // Log Storage
+    private final List<LogEntry> log = new ArrayList<>();
+    private int commitIndex = 0;
+
+    // Timers
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private ScheduledFuture<?> electionTimeoutTask;
+    private ScheduledFuture<?> heartbeatTask;
+    private final Random random = new Random();
+
+    // Tuning
+    private static final int MIN_TIMEOUT = 2000;
+    private static final int MAX_TIMEOUT = 4000;
+    private static final int HEARTBEAT_INTERVAL = 500;
 
     public RaftNode(String nodeId, RaftTransport transport) {
         this.nodeId = nodeId;
         this.transport = transport;
-
-        this.transport.registerHandler(this::handleMessage);
-
         resetElectionTimer();
-        startElectionTimer();
     }
 
-    // --- TIMING LOGIC ---
+    // --- CLIENT API ---
 
-    private void resetElectionTimer() {
-        this.lastHeartbeatTime = System.currentTimeMillis();
-        // Random timeout 300ms - 600ms
-        this.electionTimeout = 300 + random.nextInt(300);
-    }
+    /**
+     * Called when a client sends a command to this node.
+     * Returns true if queued, false if not Leader.
+     */
+    public synchronized boolean replicate(String command) {
+        if (currentRole != Role.LEADER) {
+            logger.warn("Received command '{}', but I am not Leader (Leader is: {})", command, leaderId);
+            return false;
+        }
 
-    private void startElectionTimer() {
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                if (state == State.LEADER) {
-                    sendHeartbeats();
-                    return;
-                }
+        // 1. Append to local log
+        LogEntry entry = new LogEntry(currentTerm, command);
+        log.add(entry);
+        logger.info("Leader appended entry at index {}: {}", log.size() - 1, entry);
 
-                if (System.currentTimeMillis() - lastHeartbeatTime > electionTimeout) {
-                    System.out.println(nodeId + ": Election Timeout! (" + electionTimeout + "ms). Starting election...");
-                    startElection();
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }, 0, 50, TimeUnit.MILLISECONDS);
-    }
-
-    // --- ELECTION LOGIC ---
-
-    private void startElection() {
-        state = State.CANDIDATE;
-        currentTerm++;
-        votedFor = nodeId;
-
-        // Reset counts
-        votesReceived.set(1); // Vote for self
-        votedNodes.clear();
-        votedNodes.add(nodeId);
-
-        resetElectionTimer();
-
-        System.out.println(nodeId + ": Starting Election for Term " + currentTerm);
-
-        RaftMessage voteRequest = new RaftMessage(RaftMessage.Type.REQUEST_VOTE, currentTerm, nodeId);
-        transport.broadcast(voteRequest);
+        // 2. Broadcast to followers immediately
+        sendAppendEntries();
+        return true;
     }
 
     // --- MESSAGE HANDLING ---
 
-    public RaftMessage handleMessage(RaftMessage msg) {
-        // DEBUG LOG: See exactly what hits this node
-        if (msg.getType() == RaftMessage.Type.VOTE_RESPONSE) {
-            System.out.println(nodeId + ": <<< RECEIVED VOTE RESPONSE from " + msg.getSenderId() + " for Term " + msg.getTerm());
-        }
-
-        // Step Down Logic
+    public synchronized RaftMessage handleMessage(RaftMessage msg) {
         if (msg.getTerm() > currentTerm) {
-            System.out.println(nodeId + ": Saw higher term " + msg.getTerm() + " from " + msg.getSenderId() + ". Stepping down.");
             currentTerm = msg.getTerm();
-            state = State.FOLLOWER;
-            votedFor = null;
-            resetElectionTimer();
+            becomeFollower();
         }
 
         switch (msg.getType()) {
-            case REQUEST_VOTE:
-                return handleRequestVote(msg);
-            case VOTE_RESPONSE:
-                handleVoteResponse(msg);
-                return null; // We consumed the response, nothing to return
-            case APPEND_ENTRIES:
-                return handleHeartbeat(msg);
-            default:
-                return null;
+            case CLIENT_COMMAND: return handleClietnCommand(msg);
+            case REQUEST_VOTE:      return handleRequestVote(msg);
+            case APPEND_ENTRIES:    return handleAppendEntries(msg);
+            case VOTE_RESPONSE:     handleVoteResponse(msg); return null;
+            case HEARTBEAT_RESPONSE: return null; // TODO: Handle commits
+            default: return null;
         }
+    }
+
+    private RaftMessage handleClietnCommand(RaftMessage msg) {
+        String cmd = msg.getPayload();
+        logger.info("Received command {}", cmd);
+
+        boolean success = replicate(cmd);
+
+        RaftMessage newMessage = new RaftMessage(Type.CLIENT_COMMAND, nodeId, currentTerm);
+        newMessage.setSuccess(success);
+        return newMessage;
     }
 
     private RaftMessage handleRequestVote(RaftMessage msg) {
-        boolean voteGranted = false;
-
+        boolean granted = false;
         if (msg.getTerm() >= currentTerm && (votedFor == null || votedFor.equals(msg.getSenderId()))) {
+            // Simplified check: In real Raft, we also check if candidate's log is up-to-date
             votedFor = msg.getSenderId();
-            voteGranted = true;
+            granted = true;
             resetElectionTimer();
-            System.out.println(nodeId + ": Voted for " + msg.getSenderId() + " in term " + currentTerm);
+            logger.info("Voted FOR {} in term {}", msg.getSenderId(), currentTerm);
         }
-
-        RaftMessage response = new RaftMessage(RaftMessage.Type.VOTE_RESPONSE, currentTerm, nodeId);
-        response.setSuccess(voteGranted);
-
-        // --- CRITICAL CHECK ---
-        // Ideally we want to do: transport.send(msg.getSenderId(), response);
-        // But since we rely on returning the message, ensure the transport sends it!
-        if (transport != null) {
-            transport.send(msg.getSenderId(), response);
-        }
-        return null;
+        return new RaftMessage(Type.VOTE_RESPONSE, nodeId, currentTerm, granted);
     }
 
+    private RaftMessage handleAppendEntries(RaftMessage msg) {
+        if (msg.getTerm() < currentTerm) {
+            return new RaftMessage(Type.HEARTBEAT_RESPONSE, nodeId, currentTerm, false);
+        }
+
+        this.leaderId = msg.getSenderId();
+        becomeFollower(); // Refresh follower state
+        resetElectionTimer();
+
+        // 1. Append any new entries from Leader
+        if (!msg.getEntries().isEmpty()) {
+            log.addAll(msg.getEntries());
+            logger.info("Follower appended {} entries. Log Size: {}", msg.getEntries().size(), log.size());
+        }
+
+        // 2. Update Commit Index
+        if (msg.getLeaderCommit() > commitIndex) {
+            // commitIndex = min(leaderCommit, index of last new entry)
+            commitIndex = Math.min(msg.getLeaderCommit(), log.size() - 1);
+            logger.debug("Follower commitIndex updated to {}", commitIndex);
+        }
+
+        return new RaftMessage(Type.HEARTBEAT_RESPONSE, nodeId, currentTerm, true);
+    }
+
+    // --- LEADERSHIP LOGIC ---
+
+    private int votesReceived = 0;
+
     private void handleVoteResponse(RaftMessage msg) {
-        // Detailed Logic Check with Logging
-        if (state != State.CANDIDATE) {
-            // System.out.println(nodeId + ": Ignored vote (Not Candidate)");
-            return;
-        }
-        if (msg.getTerm() != currentTerm) {
-            System.out.println(nodeId + ": Ignored vote (Term mismatch. My: " + currentTerm + ", Msg: " + msg.getTerm() + ")");
-            return;
-        }
-        if (!msg.isSuccess()) {
-            System.out.println(nodeId + ": Vote denied by " + msg.getSenderId());
-            return;
-        }
-
-        if (!votedNodes.contains(msg.getSenderId())) {
-            votedNodes.add(msg.getSenderId());
-            int totalVotes = votesReceived.incrementAndGet();
-            System.out.println(nodeId + ": Counted vote from " + msg.getSenderId() + " (Total: " + totalVotes + ")");
-
-            // Majority Check ( > 1.5, so 2 or more)
-            if (totalVotes >= 2) {
+        if (currentRole == Role.CANDIDATE && msg.isSuccess() && msg.getTerm() == currentTerm) {
+            votesReceived++;
+            int quorum = (transport.getPeerCount() + 1) / 2 + 1;
+            if (votesReceived >= quorum) {
                 becomeLeader();
             }
         }
     }
 
-    private RaftMessage handleHeartbeat(RaftMessage msg) {
-        state = State.FOLLOWER;
+    private void becomeFollower() {
+        currentRole = Role.FOLLOWER;
+        votedFor = null;
+        if (heartbeatTask != null) heartbeatTask.cancel(false);
         resetElectionTimer();
+    }
 
-        // System.out.println(nodeId + ": Heartbeat from " + msg.getSenderId());
+    private void becomeCandidate() {
+        currentRole = Role.CANDIDATE;
+        currentTerm++;
+        votedFor = nodeId;
+        votesReceived = 1;
 
-        RaftMessage response = new RaftMessage(RaftMessage.Type.APPEND_RESPONSE, currentTerm, nodeId);
-        response.setSuccess(true);
-        return response;
+        logger.info("Candidate for Term {}", currentTerm);
+
+        // Broadcast Vote Request
+        RaftMessage request = new RaftMessage(Type.REQUEST_VOTE, nodeId, currentTerm);
+        transport.broadcast(request);
+
+        resetElectionTimer();
     }
 
     private void becomeLeader() {
-        if (state != State.LEADER) {
-            state = State.LEADER;
-            System.out.println("\n" + nodeId + ": --- I AM LEADER (Term " + currentTerm + ") ---\n");
-            sendHeartbeats();
-        }
+        if (currentRole == Role.LEADER) return;
+        currentRole = Role.LEADER;
+        logger.info("!!! BECAME LEADER !!! Term {}", currentTerm);
+
+        if (electionTimeoutTask != null) electionTimeoutTask.cancel(false);
+        startHeartbeats();
     }
 
-    private void sendHeartbeats() {
-        RaftMessage heartbeat = new RaftMessage(RaftMessage.Type.APPEND_ENTRIES, currentTerm, nodeId);
-        transport.broadcast(heartbeat);
+    // --- HEARTBEATS ---
+
+    private void startHeartbeats() {
+        heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
+            synchronized (this) {
+                if (currentRole != Role.LEADER) {
+                    if (heartbeatTask != null) heartbeatTask.cancel(false);
+                    return;
+                }
+                sendAppendEntries();
+            }
+        }, 0, HEARTBEAT_INTERVAL, TimeUnit.MILLISECONDS);
+    }
+
+    private void sendAppendEntries() {
+        // Simplified: We assume Followers are always insync for now
+        int prevLogIndex = Math.max(0, log.size() - 1);
+        int prevLogTerm = log.isEmpty() ? 0 : log.get(prevLogIndex).getTerm();
+
+        RaftMessage msg = new RaftMessage(
+                Type.APPEND_ENTRIES,
+                nodeId,
+                currentTerm,
+                prevLogIndex,
+                prevLogTerm,
+                commitIndex
+        );
+
+        // In a real implementation, we would send ONLY new entries based on nextIndex[]
+        // For this step, we are just maintaining the heartbeat mechanism
+        msg.setEntries(new ArrayList<>(log));
+
+        transport.broadcast(msg);
+    }
+
+    private void resetElectionTimer() {
+        if (currentRole == Role.LEADER) return;
+        if (electionTimeoutTask != null) electionTimeoutTask.cancel(false);
+
+        long delay = MIN_TIMEOUT + random.nextInt(MAX_TIMEOUT - MIN_TIMEOUT);
+        electionTimeoutTask = scheduler.schedule(this::onElectionTimeout, delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void onElectionTimeout() {
+        synchronized (this) {
+            if (currentRole != Role.LEADER) {
+                becomeCandidate();
+            }
+        }
     }
 }

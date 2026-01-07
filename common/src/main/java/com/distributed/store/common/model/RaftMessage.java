@@ -1,30 +1,85 @@
 package com.distributed.store.common.model;
 
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 
 public class RaftMessage implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     public enum Type {
-        REQUEST_VOTE,          // "Vote for me!"
-        VOTE_RESPONSE,         // "Yes, I vote for you" or "No"
-        APPEND_ENTRIES,        // "I am Leader, here is data" (Heartbeat)
-        APPEND_RESPONSE        // "Got it"
+        REQUEST_VOTE,
+        VOTE_RESPONSE,
+        APPEND_ENTRIES,     // Heartbeat OR Data Replication
+        HEARTBEAT_RESPONSE,  // Ack for AppendEntries
+        CLIENT_COMMAND
     }
 
-    private Type type;
-    private int term;
+    private final Type type;
     private String senderId;
+    private int term;
+
+    // Response field
     private boolean success;
 
-    public RaftMessage(Type type, int term, String senderId) {
+    // Replication fields
+    private int prevLogIndex;
+    private int prevLogTerm;
+    private int leaderCommit;
+    private List<LogEntry> entries = new ArrayList<>();
+    private String payload;
+
+    // Constructor for Requests (Heartbeat/Replication)
+    public RaftMessage(Type type, String senderId, int term, int prevLogIndex, int prevLogTerm, int leaderCommit) {
         this.type = type;
-        this.term = term;
         this.senderId = senderId;
+        this.term = term;
+        this.prevLogIndex = prevLogIndex;
+        this.prevLogTerm = prevLogTerm;
+        this.leaderCommit = leaderCommit;
     }
 
-    public void setSuccess(boolean success) { this.success = success; }
+    public RaftMessage(Type type, String payload){
+        this.type = type;
+        this.entries = new ArrayList<>();
+    }
 
-    public boolean isSuccess() { return success; }
+    // Constructor for Vote Request (Simpler)
+    public RaftMessage(Type type, String senderId, int term) {
+        this(type, senderId, term, 0, 0, 0);
+    }
+
+    // Constructor for Responses
+    public RaftMessage(Type type, String senderId, int term, boolean success) {
+        this.type = type;
+        this.senderId = senderId;
+        this.term = term;
+        this.success = success;
+    }
+
+    // Setters
+    public void setEntries(List<LogEntry> entries) {
+        this.entries = (entries != null) ? entries : new ArrayList<>();
+    }
+
+    // Getters
     public Type getType() { return type; }
-    public int getTerm() { return term; }
     public String getSenderId() { return senderId; }
+    public int getTerm() { return term; }
+    public boolean isSuccess() { return success; }
+    public void setSuccess(boolean success) { this.success = success; }
+    public int getPrevLogIndex() { return prevLogIndex; }
+    public int getPrevLogTerm() { return prevLogTerm; }
+    public int getLeaderCommit() { return leaderCommit; }
+    public List<LogEntry> getEntries() { return entries; }
+    public void setPayload(String p) { this.payload = p; }
+    public String getPayload() { return payload; }
+
+    @Override
+    public String toString() {
+        if (type == Type.APPEND_ENTRIES) {
+            return "Msg{type=" + type + ", term=" + term + ", entries=" + entries.size() + "}";
+        }
+        return "Msg{type=" + type + ", term=" + term + ", success=" + success + "}";
+    }
 }
