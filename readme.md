@@ -92,13 +92,13 @@ distributed-object-store/
 
     * Atomic writes (.tmp -> rename) to prevent corruption.
     * Basic checksum validation.
+* **Log Replication:** Replicating the "File Map" state across Raft nodes.
+* **Consistent Hashing:** Logic to map files to specific storage nodes.
+* **Client Integration:** Connecting the SDK to the Metadata Leader.
 
 ## 🚧 Roadmap / In Progress
 
-* [ ] Log Replication: Replicating the "File Map" state across Raft nodes.
-* [ ] Consistent Hashing: Logic to map files to specific storage nodes.
 * [ ] Erasure Coding: Implementing Reed-Solomon to split files into chunks.
-* [ ] Client Integration: Connecting the SDK to the Metadata Leader.
 
 ## 🤝 Contributing
 
