@@ -12,163 +12,134 @@ import io.netty.handler.codec.serialization.*;
 public class DistributedClient {
 
     private final String raftLeaderHost = "localhost";
-    private final int raftLeaderPort = 9001; // Ensure this is the current LEADER
-
-    private final String storageHost = "localhost";
-    private final int storagePort = 8080;
+    private final int raftLeaderPort = 9001;
 
     public static void main(String[] args) {
         DistributedClient client = new DistributedClient();
 
-        String filename = "my_vacation.jpg";
+        System.out.println("===  STARTING HA CLIENT ===\n");
 
-        // 1. UPLOAD
-        client.uploadFile(filename, "This is the binary data of a purely imaginary image.");
+        // 1. Upload (Creates Primary + Replica)
+        client.uploadFile("important_doc1.txt", "This data must survive a crash!");
 
-        System.out.println("\n--- Simulating time passing... ---\n");
+        System.out.println("\n---  CHAOS TEST: YOU CAN KILL NODE 8080 NOW ---");
+        System.out.println("Waiting 10 seconds for you to crash the primary node...");
+        try { Thread.sleep(10000); } catch (InterruptedException e) {}
 
-        // 2. DOWNLOAD
-        client.downloadFile(filename);
+        // 2. Download (Should fail on 8080, then auto-switch to 8081)
+        client.downloadFile("important_doc1.txt");
     }
-
-    // --- HIGH LEVEL WORKFLOWS ---
 
     public void uploadFile(String filename, String content) {
-        System.out.println("--- STARTING UPLOAD: " + filename + " ---");
+        System.out.println(" UPLOAD: " + filename);
 
-        // 1. Write Data to Storage Node
-        boolean storageSuccess = sendStoragePut(filename, content);
-
-        if (storageSuccess) {
-            System.out.println("Data written to Storage Node.");
-
-            // 2. Update Metadata in Raft
-            String metadataCommand = "SET " + filename + "=" + storageHost + ":" + storagePort;
-            boolean metaSuccess = sendRaftCommand(metadataCommand);
-
-            if (metaSuccess) {
-                System.out.println("Metadata updated in Raft Cluster.");
-            } else {
-                System.out.println("Failed to update Metadata.");
-            }
-        } else {
-            System.out.println("Failed to write to Storage Node.");
-        }
-    }
-
-    public void downloadFile(String filename) {
-        System.out.println("--- STARTING DOWNLOAD: " + filename + " ---");
-
-        // 1. Ask Raft for location
-        String location = sendRaftQuery("GET " + filename);
-        System.out.println("Raft says file is at: " + location);
-
-        if (location == null || location.startsWith("ERROR") || location.equals("(null)")) {
-            System.out.println("File not found in Metadata.");
+        // 1. ALLOCATE
+        String allocation = sendRaftCommand("ALLOCATE");
+        if (allocation == null || allocation.startsWith("ERROR")) {
+            System.out.println(" Allocation Failed");
             return;
         }
 
-        // Parse location (host:port)
-        String[] parts = location.split(":");
-        String targetHost = parts[0];
-        int targetPort = Integer.parseInt(parts[1]);
+        System.out.println("   🔗 Chain: " + allocation);
+        String[] nodes = allocation.split(",");
+        String primary = nodes[0];
+        String replica = (nodes.length > 1) ? nodes[1] : null;
 
-        // 2. Fetch Data from Storage Node
-        String data = fetchFromStorage(targetHost, targetPort, filename);
+        String[] primaryParts = primary.split(":");
+        NetworkMessage putMsg = new NetworkMessage(NetworkMessage.Type.PUT, filename, content.getBytes());
+        if (replica != null) putMsg.setReplicaTarget(replica);
 
-        if (data != null) {
-            System.out.println("RECEIVED DATA: " + data);
-            System.out.println("DOWNLOAD COMPLETE!");
+        // 2. WRITE
+        Object response = sendNettyRequest(primaryParts[0], Integer.parseInt(primaryParts[1]), putMsg);
+
+        if (response instanceof Boolean && (Boolean) response) {
+            System.out.println(" Chain Write Success.");
+
+            // 3. SAVE FULL CHAIN (Primary,Replica)
+            // We save the EXACT string Raft gave us (e.g., "localhost:8080,localhost:8081")
+            String metadataCommand = "SET " + filename + "=" + allocation;
+            sendRaftCommand(metadataCommand);
+            System.out.println(" Metadata Saved: " + allocation);
         } else {
-            System.out.println("Failed to retrieve data from Storage Node.");
+            System.out.println(" Write Failed.");
         }
+        System.out.println("------------------------------------------");
     }
 
-    // --- NETTY HELPERS ---
+    public void downloadFile(String filename) {
+        System.out.println(" DOWNLOAD: " + filename);
 
-    private boolean sendStoragePut(String key, String data) {
-        return (boolean) sendNettyRequest(storageHost, storagePort,
-                new NetworkMessage(NetworkMessage.Type.PUT, key, data.getBytes()));
+        // 1. GET METADATA
+        String locationList = sendRaftCommand("GET " + filename);
+        if (locationList == null || locationList.startsWith("ERROR") || locationList.equals("(null)")) {
+            System.out.println(" File not found.");
+            return;
+        }
+
+        System.out.println(" Locations: " + locationList);
+
+        // 2. FAILOVER LOOP
+        String[] nodes = locationList.split(",");
+        String data = null;
+
+        for (String nodeAddr : nodes) {
+            System.out.print("   Trying " + nodeAddr + "... ");
+            String[] parts = nodeAddr.split(":");
+            data = fetchFromStorage(parts[0], Integer.parseInt(parts[1]), filename);
+
+            if (data != null) {
+                System.out.println(" SUCCESS!");
+                System.out.println(" CONTENT: [" + data + "]");
+                return; // Exit as soon as we get the file
+            } else {
+                System.out.println(" FAILED/UNREACHABLE");
+            }
+        }
+
+        System.out.println(" All replicas failed. Data is unavailable.");
+        System.out.println("------------------------------------------");
     }
 
+    // --- HELPERS (Unchanged) ---
     private String fetchFromStorage(String host, int port, String key) {
-        Object result = sendNettyRequest(host, port,
-                new NetworkMessage(NetworkMessage.Type.GET, key, null));
-
-        if (result instanceof String) return (String) result;
-        return null;
+        NetworkMessage request = new NetworkMessage(NetworkMessage.Type.GET, key, null);
+        Object response = sendNettyRequest(host, port, request);
+        return (response instanceof String) ? (String) response : null;
     }
-
-    private boolean sendRaftCommand(String command) {
-        RaftMessage msg = new RaftMessage(RaftMessage.Type.CLIENT_COMMAND, "CLIENT", 0);
-        msg.setPayload(command);
-        Object result = sendNettyRequest(raftLeaderHost, raftLeaderPort, msg);
-        return result instanceof Boolean && (Boolean) result;
+    private String sendRaftCommand(String command) {
+        RaftMessage msg = new RaftMessage(RaftMessage.Type.CLIENT_COMMAND, "CLIENT", 0, command);
+        Object response = sendNettyRequest(raftLeaderHost, raftLeaderPort, msg);
+        return (response instanceof String) ? (String) response : null;
     }
-
-    private String sendRaftQuery(String query) {
-        RaftMessage msg = new RaftMessage(RaftMessage.Type.CLIENT_COMMAND, "CLIENT", 0);
-        msg.setPayload(query);
-        Object result = sendNettyRequest(raftLeaderHost, raftLeaderPort, msg);
-        return (result instanceof String) ? (String) result : null;
-    }
-
     private Object sendNettyRequest(String host, int port, Object request) {
         final Object[] responseContainer = {null};
         EventLoopGroup group = new NioEventLoopGroup();
         try {
             Bootstrap b = new Bootstrap();
-            b.group(group)
-                    .channel(NioSocketChannel.class)
-                    .handler(new ChannelInitializer<SocketChannel>() {
-                        @Override
-                        public void initChannel(SocketChannel ch) {
-                            ch.pipeline().addLast(
-                                    new ObjectEncoder(),
-                                    new ObjectDecoder(ClassResolvers.cacheDisabled(null)),
-                                    new SimpleChannelInboundHandler<Object>() {
-                                        @Override
-                                        public void channelActive(ChannelHandlerContext ctx) {
-                                            ctx.writeAndFlush(request);
-                                        }
-                                        @Override
-                                        protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
-                                            // Handle Storage Messages
-                                            if (msg instanceof NetworkMessage) {
-                                                NetworkMessage netMsg = (NetworkMessage) msg;
-                                                if (netMsg.getType() == NetworkMessage.Type.RESPONSE_OK) {
-                                                    if (netMsg.getData() != null) {
-                                                        responseContainer[0] = new String(netMsg.getData()); // Return Data
-                                                    } else {
-                                                        responseContainer[0] = true; // Return Success
-                                                    }
-                                                }
-                                            }
-                                            // Handle Raft Messages
-                                            else if (msg instanceof RaftMessage) {
-                                                RaftMessage raftMsg = (RaftMessage) msg;
-                                                if (raftMsg.getPayload() != null && !raftMsg.getPayload().equals("OK")) {
-                                                    responseContainer[0] = raftMsg.getPayload(); // Return Query Result
-                                                } else {
-                                                    responseContainer[0] = raftMsg.isSuccess(); // Return Command Success
-                                                }
-                                            }
-                                            ctx.close();
-                                        }
-                                        @Override
-                                        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-                                            ctx.close();
-                                        }
+            b.group(group).channel(NioSocketChannel.class).handler(new ChannelInitializer<SocketChannel>() {
+                public void initChannel(SocketChannel ch) {
+                    ch.pipeline().addLast(new ObjectEncoder(), new ObjectDecoder(ClassResolvers.cacheDisabled(null)),
+                            new SimpleChannelInboundHandler<Object>() {
+                                public void channelActive(ChannelHandlerContext ctx) { ctx.writeAndFlush(request); }
+                                protected void channelRead0(ChannelHandlerContext ctx, Object msg) {
+                                    if (msg instanceof NetworkMessage) {
+                                        NetworkMessage nm = (NetworkMessage) msg;
+                                        responseContainer[0] = (nm.getType() == NetworkMessage.Type.RESPONSE_OK) ?
+                                                ((nm.getData() != null) ? new String(nm.getData()) : true) : null;
+                                    } else if (msg instanceof RaftMessage) {
+                                        RaftMessage rm = (RaftMessage) msg;
+                                        responseContainer[0] = (rm.getPayload() != null) ? rm.getPayload() : rm.isSuccess();
                                     }
-                            );
-                        }
-                    });
+                                    ctx.close();
+                                }
+                                public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) { ctx.close(); }
+                            });
+                }
+            });
             b.connect(host, port).sync().channel().closeFuture().sync();
         } catch (Exception e) {
-            System.err.println("Connection Failed to " + host + ":" + port);
-        } finally {
-            group.shutdownGracefully();
-        }
+            // Return null on connection failure
+        } finally { group.shutdownGracefully(); }
         return responseContainer[0];
     }
 }

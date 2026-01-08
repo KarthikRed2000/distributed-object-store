@@ -12,10 +12,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 public class RaftNode {
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
@@ -39,6 +36,10 @@ public class RaftNode {
     // Leadership State (Only used when Leader)
     private final Map<String, Integer> matchIndex = new HashMap<>();
 
+    // --- DYNAMIC CLUSTER CONFIGURATION ---
+    private final List<String> activeStorageNodes = new CopyOnWriteArrayList<>();
+    private int nextStorageNodeIndex = 0;
+
     // Timers
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private ScheduledFuture<?> electionTimeoutTask;
@@ -52,6 +53,9 @@ public class RaftNode {
 
     private final StateMachine stateMachine = new StateMachine();
     private int lastApplied = 0;
+
+    private final Map<String, Long> workerHeartbeats = new ConcurrentHashMap<>();
+    private static final long WORKER_TIMEOUT_MS = 10_000;
 
     public RaftNode(String nodeId, RaftTransport transport) {
         this.nodeId = nodeId;
@@ -93,6 +97,7 @@ public class RaftNode {
             case REQUEST_VOTE:      return handleRequestVote(msg);
             case APPEND_ENTRIES:    return handleAppendEntries(msg);
             case VOTE_RESPONSE:     handleVoteResponse(msg); return null;
+            case REGISTER_WORKER:   return handleRegisterWorker(msg);
             case HEARTBEAT_RESPONSE:
                 if (currentRole == Role.LEADER) {
                     handleHeartbeatResponse(msg);
@@ -102,20 +107,98 @@ public class RaftNode {
         }
     }
 
-    private RaftMessage handleClientCommand(RaftMessage msg) {
-        String cmd = msg.getPayload();
-        if (cmd.startsWith("GET ")) {
-            return handleClientGETQuery(msg);
+    // --- NEW: SERVICE DISCOVERY HANDLER ---
+    private RaftMessage handleRegisterWorker(RaftMessage msg) {
+        if (currentRole == Role.LEADER) {
+            String newWorker = (String) msg.getPayload();
+            long now = System.currentTimeMillis();
+
+            // Update timestamp
+            workerHeartbeats.put(newWorker, now);
+
+            if (newWorker != null && !activeStorageNodes.contains(newWorker)) {
+                activeStorageNodes.add(newWorker);
+                logger.info("NEW WORKER REGISTERED: " + newWorker);
+            }
+            return new RaftMessage(Type.CLIENT_RESPONSE, nodeId, currentTerm, "ACK");
         } else {
-            return handleClientSETCommand(msg);
+            // If we aren't leader, we could redirect, but for simplicity we ignore or return null
+            return null;
         }
     }
 
-    private RaftMessage handleClientGETQuery(RaftMessage msg) {
-        // [MODIFIED] Allow Followers to serve Reads for verification purposes
-        // In Strict Raft, we would check: if (currentRole != Role.LEADER) return failure;
+    private void startWorkerHealthCheck() {
+        scheduler.scheduleAtFixedRate(this::checkDeadWorkers, 5, 5, TimeUnit.SECONDS);
+    }
 
-        String key = msg.getPayload().substring(4).trim();
+    private void checkDeadWorkers() {
+        if (currentRole != Role.LEADER) return;
+
+        long now = System.currentTimeMillis();
+        for (String worker : activeStorageNodes) {
+            Long lastSeen = workerHeartbeats.get(worker);
+
+            if (lastSeen == null || (now - lastSeen) > WORKER_TIMEOUT_MS) {
+                logger.warn("DETECTED DEAD WORKER: " + worker + " (Last seen " + (now - lastSeen) + "ms ago)");
+
+                // Remove from the pool immediately
+                activeStorageNodes.remove(worker);
+                workerHeartbeats.remove(worker);
+            }
+        }
+    }
+
+    private RaftMessage handleClientCommand(RaftMessage msg) {
+        String cmd = (String) msg.getPayload();
+
+        // 1. Handle ALLOCATION (Load Balancing)
+        if (cmd.equals("ALLOCATE")) {
+            return handleAllocationRequest();
+        }
+        // 2. Handle Reads (GET)
+        else if (cmd.startsWith("GET ")) {
+            return handleClientGETQuery(cmd);
+        }
+        // 3. Handle Writes (SET)
+        else {
+            return handleClientSETCommand(cmd);
+        }
+    }
+
+    // --- NEW: ALLOCATION LOGIC ---
+    private RaftMessage handleAllocationRequest() {
+        if (currentRole != Role.LEADER) {
+            return new RaftMessage(Type.CLIENT_RESPONSE, nodeId, currentTerm, "REDIRECT:" + leaderId);
+        }
+
+        if (activeStorageNodes.isEmpty()) {
+            RaftMessage response = new RaftMessage(Type.CLIENT_RESPONSE, nodeId, currentTerm, false);
+            response.setPayload("ERROR: No Storage Nodes Available");
+            return response;
+        }
+
+        String primary = activeStorageNodes.get(nextStorageNodeIndex);
+        nextStorageNodeIndex = (nextStorageNodeIndex + 1) % activeStorageNodes.size();
+
+        String replica = null;
+        if(activeStorageNodes.size() > 1){
+            replica = activeStorageNodes.get(nextStorageNodeIndex);
+            nextStorageNodeIndex = (nextStorageNodeIndex + 1) % activeStorageNodes.size();
+        }
+
+        String allocation = primary;
+        if (replica != null) {
+            allocation += "," + replica;
+        }
+
+        logger.info("Allocating Chain: " + allocation);
+        RaftMessage response = new RaftMessage(Type.CLIENT_RESPONSE, nodeId, currentTerm, true);
+        response.setPayload(allocation);
+        return response;
+    }
+
+    private RaftMessage handleClientGETQuery(String cmd) {
+        String key = cmd.substring(4).trim();
         String value = stateMachine.get(key);
 
         RaftMessage response = new RaftMessage(Type.CLIENT_COMMAND, nodeId, currentTerm, true);
@@ -123,11 +206,11 @@ public class RaftNode {
         return response;
     }
 
-    private RaftMessage handleClientSETCommand(RaftMessage msg) {
-        // SET still requires Leader
-        boolean success = replicate(msg.getPayload());
+    private RaftMessage handleClientSETCommand(String cmd) {
+        // SET requires Consensus via Log Replication
+        boolean success = replicate(cmd);
         RaftMessage response = new RaftMessage(Type.CLIENT_COMMAND, nodeId, currentTerm, success);
-        response.setPayload("OK");
+        response.setPayload(success ? "OK" : "ERROR");
         return response;
     }
 
@@ -155,7 +238,7 @@ public class RaftNode {
 
         List<LogEntry> leaderEntries = msg.getEntries();
 
-        // [MODIFIED] 3. LOG REPAIR & CONFLICT RESOLUTION
+        // 3. LOG REPAIR & CONFLICT RESOLUTION
         int i = 0;
         while (i < leaderEntries.size()) {
             LogEntry leaderEntry = leaderEntries.get(i);
@@ -252,6 +335,7 @@ public class RaftNode {
         matchIndex.clear();
         if (electionTimeoutTask != null) electionTimeoutTask.cancel(false);
         startHeartbeats();
+        startWorkerHealthCheck();
     }
 
     // --- HEARTBEATS ---

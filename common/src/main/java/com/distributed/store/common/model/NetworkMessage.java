@@ -9,6 +9,7 @@ public class NetworkMessage implements Serializable {
     private final String key;     // Chunk ID
     private final byte[] data;    // Payload (for PUT or RESPONSE)
     private final String message; // Error message or Status text
+    private String replicaTarget;
 
     // Constructor for Requests (PUT/GET)
     public NetworkMessage(Type type, String key, byte[] data) {
@@ -25,6 +26,9 @@ public class NetworkMessage implements Serializable {
         this.data = data;
         this.message = message;
     }
+
+    public void setReplicaTarget(String target) { this.replicaTarget = target; }
+    public String getReplicaTarget() { return replicaTarget; }
 
     public Type getType() { return type; }
     public String getKey() { return key; }
